@@ -4,7 +4,8 @@
 
 1. Adapter trimming with HiFiAdapterFilt
 2. Assembly with HiFiASM
-3. Reorienting chromosomal plasmids to match the canonical positioning of __Salmonella enterica__ subsp. enterica serovar Typhimurium str. LT2
+3. Reorienting chromosomal plasmids to match the canonical positioning of *Salmonella enterica* subsp. enterica serovar Typhimurium str. LT2
+4. Annotation with Batka
 
 ## Status 
 
