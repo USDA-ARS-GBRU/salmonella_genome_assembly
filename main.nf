@@ -1,59 +1,35 @@
 nextflow.enable.dsl=2
 
-params.input_dir = "data/*.bam"
-params.outdir = "results"
+params.outdir = "/project/gbru_fy21_salm_compgen/annette/salmonella_genome_assembly/work"
+params.reads = "/project/gbru_fy21_salm_compgen/annette/salmonella_genome_assembly/work/bam_data/*.fastq.gz"
+
 // Define where to store the persistent Bakta database
-params.bakta_db_path = "${baseDir}/bakta_db"
+params.bakta_db_path = "${projectDir}/bakta_db"
+bakta_db_ch = Channel.value( file(params.bakta_db_path) )
 
 workflow {
-    input_ch = Channel.fromPath(params.input_dir)
-
-    // Setup: Download Bakta DB if it doesn't exist
-    db_ch = BAKTA_DOWNLOAD()
-
-    // Main Pipeline
-    filtered_reads = ADAPTER_FILT(input_ch)
+    // Reads were filtered manually using hifiadapfilter.
+    filtered_reads = Channel.fromPath(params.reads)
+    // Assemble 
     hifiasm_out    = HIFIASM(filtered_reads)
-    oriented_fa    = ORIENTATION(hifiasm_out)
+    // If the assembly is empty, shunt it to a different process and log it.
+    valid_assemblies = hifiasm_out.filter { sample_id, gfa, fasta -> fasta.size() > 0 }
+    empty_assemblies = hifiasm_out.filter { sample_id, gfa, fasta -> fasta.size() == 0 }
+
+    LOG_EMPTY_ASSEMBLY(empty_assemblies)
     
+    // Add the orientation script to each assembly tuple using map
+    orientation_input = valid_assemblies.map { sample_id, gfa, fasta ->
+        tuple(sample_id, gfa, fasta, file("${projectDir}/bin/orientation.py"))
+    }
+
+    // Non-empty assemblies continue in the process
+    oriented_fa    = ORIENTATION(orientation_input)
+    trna_out       = TRNASCAN(oriented_fa)
+
     // Annotation: Uses the oriented FASTA and the DB from the download step
-    BAKTA_ANNOTATE(oriented_fa, db_ch.collect())
-}
-
-process BAKTA_DOWNLOAD {
-    container 'staphb/bakta:1.12.0'
-    storeDir params.bakta_db_path // Persistent storage across runs
-
-    output:
-    path "db-full", type: 'dir'
-
-    script:
-    """
-    bakta_db download --output . --type full
-    """
-}
-
-
-// ... Keep ADAPTER_FILT, HIFIASM, and ORIENTATION processes from previous script ...
-
-
-process ADAPTER_FILT {
-    container 'biocontainers/hifiadapterfilt:2.0.0_cv2'
-    publishDir "${params.outdir}/${bam.baseName}/filtered_reads", mode: 'copy'
-    
-    input:
-    path bam
-
-    output:
-    // hifiadapterfilt outputs a .filt.fastq.gz file by default
-    path "${bam.baseName}.filt.fastq.gz"
-
-    script:
-    """
-    # hifiadapterfilt.sh runs on all BAM/FASTQ in the work directory if no -p is provided.
-    # We use -p to specify the specific file and -t for threads.
-    hifiadapterfilt.sh -p ${bam.baseName} -t ${task.cpus}
-    """
+    bakta_input = oriented_fa.combine(bakta_db_ch)
+    BAKTA_ANNOTATE(bakta_input)
 }
 
 process HIFIASM {
@@ -74,43 +50,78 @@ process HIFIASM {
     """
 }
 
-process ORIENTATION {
-    container 'quay.io/biocontainers/mappy:2.26--py310h50d9931_0'
-    executor 'local'
-    publishDir "${params.outdir}/${sample_id}/oriented", mode: 'copy'
+process LOG_EMPTY_ASSEMBLY {
+    container 'quay.io/biocontainers/bakta:1.12.0--pyhdfd78af_0'
+    tag "$sample_id"
 
     input:
     tuple val(sample_id), path(gfa), path(fasta)
 
+    script:
+    """
+    SIZE=\$(wc -c < "${fasta}")    
+    echo "WARNING: Sample '${sample_id}' skipped — empty assembly (size: \$SIZE bytes)" >&2
+    """
+}
+
+process ORIENTATION {
+    // Container is defined in nextflow.config
+    publishDir "${params.outdir}/${sample_id}/oriented", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(gfa), path(fasta), path(orientation_script)
+
     output:
-    path "oriented_${sample_id}.fasta"
+    tuple val(sample_id), path("oriented_${sample_id}.fasta")
 
     script:
     """
-    python ${baseDir}/orientation.py -i ${fasta} -output oriented_${sample_id}.fasta
+    python3 ${orientation_script} -i ${fasta} -output oriented_${sample_id}.fasta
+    """
+}
+
+process TRNASCAN {
+    container 'quay.io/biocontainers/bakta:1.12.0--pyhdfd78af_0'
+    publishDir "${params.outdir}/${sample_id}/trna", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(fasta)
+
+    output:
+    tuple val(sample_id), path("${sample_id}.trna.gff")
+
+    script:
+    """
+    export TMPDIR=`pwd`
+    tRNAscan-SE \
+        -B \
+        --detail \
+        --thread ${task.cpus} \
+        -o ${sample_id}.trna.gff \
+        ${fasta}
     """
 }
 
 
 process BAKTA_ANNOTATE {
-    container 'staphb/bakta:1.12.0'
+    container 'quay.io/biocontainers/bakta:1.12.0--pyhdfd78af_0'
     publishDir "${params.outdir}/${sample_id}/annotation", mode: 'copy'
 
     input:
-    tuple val(sample_id), path(fasta)
-    path db // Staged from the BAKTA_DOWNLOAD process
+    tuple val(sample_id), path(fasta), path(bakta_db)
 
     output:
-    path "${sample_id}_bakta/*"
+    path "${sample_id}_bakta"
 
     script:
     """
-    bakta --db ${db} \
+    bakta --db ${bakta_db} \
           --genus Salmonella \
           --species enterica \
           --complete \
           --gram - \
-          --outdir "${sample_id}_bakta" \
+          --skip-trna \
+          --output "${sample_id}_bakta" \
           --prefix "${sample_id}" \
           --threads ${task.cpus} \
           ${fasta}
